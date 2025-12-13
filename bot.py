@@ -44,11 +44,12 @@ class HistoryMiddleware(BaseMiddleware):
         data: Dict[str, Any]
     ) -> Any:
         if isinstance(event, Message) and event.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-            chat_id = event.chat.id
-            user_id = event.from_user.id
             text = event.text or event.caption or ""
 
-            if text:
+            # Игнорируем пустые сообщения и КОМАНДЫ (начинаются с /)
+            if text and not text.strip().startswith("/"):
+                chat_id = event.chat.id
+                user_id = event.from_user.id
                 user_name = USER_MAPPING.get(user_id, event.from_user.full_name)
                 
                 if chat_id not in chat_histories:
@@ -63,35 +64,39 @@ class HistoryMiddleware(BaseMiddleware):
 router.message.middleware(HistoryMiddleware())
 
 
-# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ЗАПРОСА ---
+# --- ФУНКЦИЯ ЗАПРОСА (ИСПРАВЛЕНА ПОД API) ---
 async def make_api_request(context_string: str) -> str | None:
     if not ML_MODEL_URL:
         logger.error("ML_MODEL_URL is not set!")
         return None
 
+    # Добавляем /generate, если его нет в URL
+    url = ML_MODEL_URL
+    if not url.endswith("generate"):
+        url = f"{url.rstrip('/')}/generate"
+
     try:
         async with aiohttp.ClientSession() as session:
-            # Используем структуру запроса как в рабочем примере:
-            # 1. Явно указываем headers
-            # 2. Передаем json
-            logger.info(f"POST Request to: {ML_MODEL_URL}")
+            # ИСПРАВЛЕНИЕ 1: Ключ JSON изменен с "input_string" на "prompt"
+            payload = {"prompt": context_string}
+            
+            logger.info(f"POST Request to: {url}")
             
             async with session.post(
-                ML_MODEL_URL,
+                url,
                 headers={"Content-Type": "application/json"},
-                json={"input_string": context_string},
-                timeout=15  # Ставим чуть больше (15с), так как генерация текста тяжелее классификации
+                json=payload,
+                timeout=20
             ) as response:
                 
                 if response.status == 200:
                     data = await response.json()
-                    # Берем поле generated_text, как вы просили
+                    # ИСПРАВЛЕНИЕ 2: Берем поле "generated_text"
                     return data.get("generated_text")
                 else:
                     logger.error(f"API Error. Status: {response.status}")
                     logger.error(f"Response text: {await response.text()}")
                     return None
-
     except Exception as e:
         logger.error(f"API Connection Error: {e}")
         return None
@@ -124,8 +129,9 @@ async def set_threshold(message: Message, command: CommandObject):
 async def force_generate(message: Message):
     chat_id = message.chat.id
     
+    # Так как мы теперь игнорируем команды в истории, проверяем, есть ли там вообще обычные сообщения
     if chat_id not in chat_histories or not chat_histories[chat_id]:
-        await message.reply("История пуста.")
+        await message.reply("История пуста (команды не сохраняются). Напишите что-нибудь.")
         return
 
     context_string = "\n".join(chat_histories[chat_id]) + "\n"
@@ -137,7 +143,6 @@ async def force_generate(message: Message):
         await message.reply(result)
         chat_histories[chat_id].append(f"[BOT]: {result}")
     else:
-        # Теперь тут будет понятнее, почему ошибка, если посмотреть в консоль
         await message.reply("Ошибка API (проверьте логи консоли).")
 
 
@@ -148,11 +153,20 @@ async def handle_random_response(message: Message):
     if message.chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
         return
 
+    # Пропускаем команды, чтобы бот не триггерился на случайные команды
+    if message.text and message.text.startswith("/"):
+        return
+
     chance = random.random()
     logger.info(f"Chance: {chance:.4f} / Threshold: {CURRENT_THRESHOLD}")
     
     if chance < CURRENT_THRESHOLD:
         chat_id = message.chat.id
+        # Если история пуста, берем текущее сообщение (так как middleware его уже добавил, если оно не команда)
+        if chat_id not in chat_histories:
+             # На всякий случай, если middleware сработал позже или рассинхрон
+             return 
+
         context_string = "\n".join(chat_histories[chat_id]) + "\n"
         
         result = await make_api_request(context_string)
