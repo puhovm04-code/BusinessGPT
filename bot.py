@@ -9,14 +9,14 @@ from datetime import datetime
 from collections import deque
 from typing import Callable, Dict, Any, Awaitable
 
-from aiogram import Router, Bot, BaseMiddleware
+from aiogram import Router, Bot, Dispatcher, BaseMiddleware
 from aiogram.types import Message, TelegramObject
 from aiogram.filters import Command, CommandObject
 from aiogram.enums import ChatType
-
-router = Router()
+from aiohttp import web  # Нужно для "обмана" Render
 
 # --- КОНФИГУРАЦИЯ ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # Убедитесь, что токен берется из env или вставьте сюда
 USER_MAPPING = {
     814759080: "A. H.",
     1214336850: "Саня Блок",
@@ -43,9 +43,26 @@ logger.info(f"Initial THRESHOLD: {CURRENT_THRESHOLD}")
 logger.info(f"ML_MODEL_URL: {ML_MODEL_URL}")
 
 chat_histories = {}
-
-# Блокировка для очереди запросов
 api_lock = asyncio.Lock()
+router = Router()
+
+# --- ФЕЙКОВЫЙ СЕРВЕР ДЛЯ RENDER ---
+async def start_dummy_server():
+    """Запускает маленький веб-сервер, чтобы Render не убивал бота"""
+    app = web.Application()
+    async def handle(request):
+        return web.Response(text="Bot is running OK")
+    
+    app.router.add_get('/', handle)
+    app.router.add_get('/health', handle)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render требует слушать порт 10000 (или тот, что в переменной PORT)
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"✅ Dummy web server started on port {port}")
 
 # --- MIDDLEWARE ---
 class HistoryMiddleware(BaseMiddleware):
@@ -58,12 +75,10 @@ class HistoryMiddleware(BaseMiddleware):
         if isinstance(event, Message) and event.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
             text = event.text or event.caption or ""
 
-            # 1. Обрезка входящего текста
             if len(text) > MAX_INPUT_LENGTH:
                 text = text[:MAX_INPUT_LENGTH]
 
             if text and not text.strip().startswith("/"):
-                # Вырезаем тег бота и лишние пробелы
                 clean_text = re.sub(f"@{BOT_USERNAME}", "", text, flags=re.IGNORECASE).strip()
                 clean_text = re.sub(r'\s+', ' ', clean_text)
 
@@ -77,45 +92,36 @@ class HistoryMiddleware(BaseMiddleware):
                     
                     formatted_line = f"[{user_name}]: {clean_text}"
                     chat_histories[chat_id].append(formatted_line)
-                    logger.debug(f"Saved to history: {formatted_line}")
 
         return await handler(event, data)
 
 router.message.middleware(HistoryMiddleware())
 
-
-# --- ФУНКЦИЯ ОЧИСТКИ (ИСПРАВЛЕННАЯ) ---
+# --- ФУНКЦИЯ ОЧИСТКИ ---
 def clean_model_output(full_response: str, input_context: str) -> str | None:
     if not full_response:
         return None
 
-    # 1. Отделяем сгенерированное от контекста
     if full_response.startswith(input_context):
         generated_only = full_response[len(input_context):]
     else:
         generated_only = full_response
 
-    # 2. Убираем пробелы по краям
     generated_only = generated_only.strip()
-    
     if not generated_only:
         return None
 
-    # 3. Фильтрация: убираем строки, похожие на теги имен, если они в начале
-    # Например, если модель начала с "[Bot]: Привет", убираем "[Bot]:"
+    # Убираем [Bot]: в начале
     clean_text = re.sub(r"^\[.*?\]:\s*", "", generated_only)
     
-    # 4. Если модель начала галлюцинировать продолжение диалога за других,
-    # обрезаем текст до первого вхождения переноса строки с тегом `[...]`
-    # (Это предотвратит попадание в ответ реплик, которые модель придумала за юзера)
+    # Обрезаем, если бот начал генерировать реплики за других пользователей
     split_match = re.search(r"\n\[.*?\]:", clean_text)
     if split_match:
         clean_text = clean_text[:split_match.start()]
 
     return clean_text.strip() if clean_text.strip() else None
 
-
-# --- ЗАПРОС К API (С ОТЛАДКОЙ) ---
+# --- ЗАПРОС К API ---
 async def make_api_request(context_string: str) -> str | None:
     if not ML_MODEL_URL:
         logger.error("ML_MODEL_URL is not set!")
@@ -125,50 +131,36 @@ async def make_api_request(context_string: str) -> str | None:
     if not url.endswith("generate"):
         url = f"{url.rstrip('/')}/generate"
 
-    timeout_settings = aiohttp.ClientTimeout(total=25, connect=5)
+    timeout_settings = aiohttp.ClientTimeout(total=30, connect=5)
 
     try:
         async with aiohttp.ClientSession(timeout=timeout_settings) as session:
             payload = {"prompt": context_string}
             
-            logger.info(f"POST Request sending... (Queue size: Locked={api_lock.locked()})")
+            logger.info(f"Generating... (Lock state: {api_lock.locked()})")
             start_time = time.time()
             
-            async with session.post(
-                url,
-                headers={"Content-Type": "application/json"},
-                json=payload
-            ) as response:
-                
+            async with session.post(url, json=payload) as response:
                 duration = time.time() - start_time
-                logger.info(f"Request finished in {duration:.2f}s with status {response.status}")
-
+                
                 if response.status == 200:
                     data = await response.json()
                     raw_text = data.get("generated_text", "")
                     
-                    # --- ВАЖНЫЙ ЛОГ ДЛЯ ОТЛАДКИ ---
-                    # Показывает, что реально вернула модель ДО очистки
-                    # Ограничим вывод 200 символами, чтобы не засорять логи
-                    log_preview = raw_text[len(context_string):].strip()
-                    logger.info(f"Model RAW output (truncated): {log_preview[:200]}...") 
-                    # ------------------------------
-
-                    cleaned = clean_model_output(raw_text, context_string)
+                    # Логируем начало ответа для отладки
+                    preview = raw_text[len(context_string):].strip().replace('\n', ' ')[:50]
+                    logger.info(f"Done in {duration:.2f}s. Raw start: '{preview}...'")
                     
-                    if not cleaned:
-                        logger.warning("⚠️ Response was empty after cleaning!")
-                    
-                    return cleaned
+                    return clean_model_output(raw_text, context_string)
                 else:
-                    logger.error(f"API Error. Status: {response.status}")
+                    logger.error(f"API Error {response.status}")
                     return None
                     
     except asyncio.TimeoutError:
-        logger.error("API Error: Timeout (Server took >25s or unreachable)")
+        logger.error("API Timeout (>30s)")
         return None
     except Exception as e:
-        logger.error(f"API Connection Error: {e}")
+        logger.error(f"API Exception: {e}")
         return None
 
 # --- КОМАНДЫ ---
@@ -177,95 +169,99 @@ async def set_threshold(message: Message, command: CommandObject):
     global CURRENT_THRESHOLD
     if message.from_user.id not in ADMIN_IDS:
         return
-
+    
     if not command.args:
-        await message.reply(f"Текущий threshold: {CURRENT_THRESHOLD}")
+        await message.reply(f"Threshold: {CURRENT_THRESHOLD}")
         return
 
     try:
         new_value = float(command.args.replace(",", "."))
         if 0 <= new_value <= 1:
             CURRENT_THRESHOLD = new_value
-            await message.reply(f"✅ Новый threshold: {CURRENT_THRESHOLD}")
+            await message.reply(f"✅ Threshold: {CURRENT_THRESHOLD}")
         else:
-            await message.reply("❌ Число от 0 до 1")
+            await message.reply("❌ 0.0 - 1.0")
     except ValueError:
-        await message.reply("❌ Некорректное число")
+        pass
 
-
-# --- ОБРАБОТЧИК СООБЩЕНИЙ ---
+# --- ГЛАВНЫЙ ХЕНДЛЕР ---
 @router.message()
 async def handle_messages(message: Message):
+    # Игнорируем личные сообщения и команды
     if message.chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
         return
-
     if message.text and message.text.strip().startswith("/"):
         return
 
-    # --- ЗАЩИТА ОТ СТАРЫХ СООБЩЕНИЙ ---
-    # Если сообщение старше 120 секунд, игнорируем его (чтобы бот не отвечал на историю после рестарта)
-    msg_date = message.date
-    if (datetime.now(msg_date.tzinfo) - msg_date).total_seconds() > 120:
-        logger.warning(f"Skipping old message from {msg_date}")
+    # Защита от обработки старых сообщений после рестарта (старше 2 минут)
+    if (datetime.now(message.date.tzinfo) - message.date).total_seconds() > 120:
         return
 
+    # Обрезка текста
     text = message.text or ""
-    # Обрезаем текст и тут для проверки триггеров
     if len(text) > MAX_INPUT_LENGTH:
         text = text[:MAX_INPUT_LENGTH]
 
     trigger_type = None
     bot_id = message.bot.id
     
-    # 1. Reply
+    # Определение триггера
     if message.reply_to_message and message.reply_to_message.from_user.id == bot_id:
         trigger_type = "forced"
-        logger.info("Trigger: Reply to bot")
-
-    # 2. Mention
     elif f"@{BOT_USERNAME}" in text.lower():
         trigger_type = "forced"
-        logger.info("Trigger: Mention of bot")
-
-    # 3. Random
     else:
-        # ПРОВЕРКА БЛОКИРОВКИ СРАЗУ
-        # Если бот уже занят генерацией, мы даже не кидаем кубик для рандома, чтобы не спамить в логи
+        # Если бот занят, рандом даже не считаем
         if api_lock.locked():
-            return 
-
-        chance = random.random()
-        if chance < CURRENT_THRESHOLD:
-            logger.info(f"Random trigger hit! ({chance:.4f} < {CURRENT_THRESHOLD})")
-            trigger_type = "random"
-        else:
-            logger.info(f"Random skip ({chance:.4f} >= {CURRENT_THRESHOLD})")
-
-    # --- ГЕНЕРАЦИЯ ---
-    if trigger_type:
-        # Двойная проверка для Random: если блокировка занята - выход
-        if trigger_type == "random" and api_lock.locked():
-            logger.info("Skipping random generation (Lock busy)")
             return
+        if random.random() < CURRENT_THRESHOLD:
+            trigger_type = "random"
 
-        if message.chat.id not in chat_histories or not chat_histories[message.chat.id]:
-             return 
+    if not trigger_type:
+        return
 
+    # Проверка блокировки перед запуском
+    if trigger_type == "random" and api_lock.locked():
+        logger.info("Skip random: Busy")
+        return
+
+    # Генерация
+    if message.chat.id in chat_histories and chat_histories[message.chat.id]:
         context_string = "\n".join(chat_histories[message.chat.id]) + "\n"
         
-        # Визуальная реакция только для forced, чтобы не спамить "печатает" постоянно
         if trigger_type == "forced":
             await message.bot.send_chat_action(message.chat.id, "typing")
         
-        # Блокировка
         async with api_lock:
-            # Внутри блокировки проверяем ещё раз, не прошло ли слишком много времени
             result = await make_api_request(context_string)
         
         if result:
-            if trigger_type == "forced":
-                await message.reply(result)
-            else:
-                await message.answer(result)
-            
-            chat_histories[message.chat.id].append(f"[BOT]: {result}")
+            try:
+                if trigger_type == "forced":
+                    await message.reply(result)
+                else:
+                    await message.answer(result)
+                
+                chat_histories[message.chat.id].append(f"[BOT]: {result}")
+            except Exception as e:
+                logger.error(f"Failed to send message: {e}")
+
+# --- ЗАПУСК ---
+async def main():
+    bot = Bot(token=os.getenv("BOT_TOKEN")) # Токен должен быть в ENV
+    dp = Dispatcher()
+    dp.include_router(router)
+    
+    # 1. Запускаем фейковый сервер для Render
+    await start_dummy_server()
+    
+    # 2. Удаляем вебхук (на случай конфликтов) и запускаем поллинг
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("🤖 Bot started polling...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped")
