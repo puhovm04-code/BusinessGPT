@@ -16,7 +16,6 @@ router = Router()
 USER_MAPPING = {
     814759080: "A. H.",
     1214336850: "Саня Блок",
-    # Исправлено: Убраны дубликаты ID (оставлен последний вариант для 485898893)
     485898893: "Влад Блок",
     1313515064: "Булгак",
     1035739386: "Вован Крюк"
@@ -27,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 CURRENT_THRESHOLD = float(os.getenv("THRESHOLD", "0.2"))
-ML_MODEL_URL = os.getenv("ML_MODEL_URL") # Убедитесь, что тут полный путь, например http://ip:port/generate
+ML_MODEL_URL = os.getenv("ML_MODEL_URL")
 admin_ids_str = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(x) for x in admin_ids_str.split(",") if x.strip().isdigit()]
 
@@ -44,7 +43,6 @@ class HistoryMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any]
     ) -> Any:
-        # Перехватываем сообщения только в группах
         if isinstance(event, Message) and event.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
             chat_id = event.chat.id
             user_id = event.from_user.id
@@ -56,18 +54,16 @@ class HistoryMiddleware(BaseMiddleware):
                 if chat_id not in chat_histories:
                     chat_histories[chat_id] = deque(maxlen=10)
                 
-                # Сохраняем в историю
                 formatted_line = f"[{user_name}]: {text}"
                 chat_histories[chat_id].append(formatted_line)
                 logger.debug(f"Saved to history: {formatted_line}")
 
         return await handler(event, data)
 
-# Подключаем Middleware к роутеру
 router.message.middleware(HistoryMiddleware())
 
 
-# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ЗАПРОСА ---
+# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ЗАПРОСА ---
 async def make_api_request(context_string: str) -> str | None:
     if not ML_MODEL_URL:
         logger.error("ML_MODEL_URL is not set!")
@@ -75,22 +71,27 @@ async def make_api_request(context_string: str) -> str | None:
 
     try:
         async with aiohttp.ClientSession() as session:
-            payload = {"input_string": context_string}
+            # Используем структуру запроса как в рабочем примере:
+            # 1. Явно указываем headers
+            # 2. Передаем json
+            logger.info(f"POST Request to: {ML_MODEL_URL}")
             
-            logger.info(f"POST Request to: {ML_MODEL_URL}") # Логируем куда шлем
-            
-            async with session.post(ML_MODEL_URL, json=payload, timeout=10) as response:
+            async with session.post(
+                ML_MODEL_URL,
+                headers={"Content-Type": "application/json"},
+                json={"input_string": context_string},
+                timeout=15  # Ставим чуть больше (15с), так как генерация текста тяжелее классификации
+            ) as response:
+                
                 if response.status == 200:
                     data = await response.json()
-                    # Пытаемся достать текст из разных возможных ключей
-                    if isinstance(data, str):
-                        return data
-                    # Проверяем ключи 'response', 'generated_text' или просто возвращаем весь JSON
-                    return data.get("response") or data.get("generated_text") or str(data)
+                    # Берем поле generated_text, как вы просили
+                    return data.get("generated_text")
                 else:
-                    logger.error(f"API Error 404/500. Status: {response.status}")
+                    logger.error(f"API Error. Status: {response.status}")
                     logger.error(f"Response text: {await response.text()}")
                     return None
+
     except Exception as e:
         logger.error(f"API Connection Error: {e}")
         return None
@@ -123,7 +124,6 @@ async def set_threshold(message: Message, command: CommandObject):
 async def force_generate(message: Message):
     chat_id = message.chat.id
     
-    # Благодаря Middleware история уже пополнилась даже этим сообщением /generate
     if chat_id not in chat_histories or not chat_histories[chat_id]:
         await message.reply("История пуста.")
         return
@@ -135,9 +135,9 @@ async def force_generate(message: Message):
 
     if result:
         await message.reply(result)
-        # Добавляем ответ бота в историю, чтобы он не терял нить
         chat_histories[chat_id].append(f"[BOT]: {result}")
     else:
+        # Теперь тут будет понятнее, почему ошибка, если посмотреть в консоль
         await message.reply("Ошибка API (проверьте логи консоли).")
 
 
@@ -147,8 +147,6 @@ async def force_generate(message: Message):
 async def handle_random_response(message: Message):
     if message.chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
         return
-
-    # Middleware УЖЕ сохранил сообщение. Здесь только логика ответа.
 
     chance = random.random()
     logger.info(f"Chance: {chance:.4f} / Threshold: {CURRENT_THRESHOLD}")
