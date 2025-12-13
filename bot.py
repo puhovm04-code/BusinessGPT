@@ -2,6 +2,7 @@ import os
 import logging
 import random
 import aiohttp
+import re  # Для регулярных выражений
 from collections import deque
 from typing import Callable, Dict, Any, Awaitable
 
@@ -21,7 +22,6 @@ USER_MAPPING = {
     1035739386: "Вован Крюк"
 }
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ logger.info(f"ML_MODEL_URL: {ML_MODEL_URL}")
 
 chat_histories = {}
 
-# --- MIDDLEWARE (ЧТОБЫ БОТ ЗАПОМИНАЛ ВСЕ) ---
+# --- MIDDLEWARE ---
 class HistoryMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -46,7 +46,7 @@ class HistoryMiddleware(BaseMiddleware):
         if isinstance(event, Message) and event.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
             text = event.text or event.caption or ""
 
-            # Игнорируем пустые сообщения и КОМАНДЫ (начинаются с /)
+            # Игнорируем команды при записи в историю
             if text and not text.strip().startswith("/"):
                 chat_id = event.chat.id
                 user_id = event.from_user.id
@@ -64,20 +64,45 @@ class HistoryMiddleware(BaseMiddleware):
 router.message.middleware(HistoryMiddleware())
 
 
-# --- ФУНКЦИЯ ЗАПРОСА (ИСПРАВЛЕНА ПОД API) ---
+# --- ФУНКЦИЯ ОЧИСТКИ (ЧТОБЫ ОСТАЛАСЬ 1 СТРОКА БЕЗ НИКА) ---
+def clean_model_output(full_response: str, input_context: str) -> str | None:
+    if not full_response:
+        return None
+
+    # 1. Если модель вернула исходный текст в начале — отрезаем его
+    # Мы не трогаем вход, мы просто убираем его копию из выхода
+    if full_response.startswith(input_context):
+        generated_only = full_response[len(input_context):]
+    else:
+        generated_only = full_response
+
+    # 2. Разбиваем на строки и берем ПОСЛЕДНЮЮ непустую
+    lines = [line.strip() for line in generated_only.split('\n') if line.strip()]
+    
+    if not lines:
+        return None
+    
+    last_line = lines[-1]
+
+    # 3. Регулярка: удаляем "[Любой Текст]: " в начале строки
+    # Пример: "[Александр Блок]: Привет" -> "Привет"
+    cleaned_line = re.sub(r"^\[.*?\]:\s*", "", last_line)
+
+    return cleaned_line if cleaned_line else None
+
+
+# --- ЗАПРОС К API ---
 async def make_api_request(context_string: str) -> str | None:
     if not ML_MODEL_URL:
         logger.error("ML_MODEL_URL is not set!")
         return None
 
-    # Добавляем /generate, если его нет в URL
     url = ML_MODEL_URL
     if not url.endswith("generate"):
         url = f"{url.rstrip('/')}/generate"
 
     try:
         async with aiohttp.ClientSession() as session:
-            # ИСПРАВЛЕНИЕ 1: Ключ JSON изменен с "input_string" на "prompt"
             payload = {"prompt": context_string}
             
             logger.info(f"POST Request to: {url}")
@@ -91,8 +116,11 @@ async def make_api_request(context_string: str) -> str | None:
                 
                 if response.status == 200:
                     data = await response.json()
-                    # ИСПРАВЛЕНИЕ 2: Берем поле "generated_text"
-                    return data.get("generated_text")
+                    raw_text = data.get("generated_text", "")
+                    
+                    # ПРИМЕНЯЕМ ФИЛЬТР
+                    final_text = clean_model_output(raw_text, context_string)
+                    return final_text
                 else:
                     logger.error(f"API Error. Status: {response.status}")
                     logger.error(f"Response text: {await response.text()}")
@@ -129,9 +157,8 @@ async def set_threshold(message: Message, command: CommandObject):
 async def force_generate(message: Message):
     chat_id = message.chat.id
     
-    # Так как мы теперь игнорируем команды в истории, проверяем, есть ли там вообще обычные сообщения
     if chat_id not in chat_histories or not chat_histories[chat_id]:
-        await message.reply("История пуста (команды не сохраняются). Напишите что-нибудь.")
+        await message.reply("История пуста. Напишите что-нибудь.")
         return
 
     context_string = "\n".join(chat_histories[chat_id]) + "\n"
@@ -141,9 +168,10 @@ async def force_generate(message: Message):
 
     if result:
         await message.reply(result)
+        # В историю добавляем чистый ответ бота
         chat_histories[chat_id].append(f"[BOT]: {result}")
     else:
-        await message.reply("Ошибка API (проверьте логи консоли).")
+        await message.reply("Не удалось сгенерировать ответ.")
 
 
 # --- ОБРАБОТКА РАНДОМА ---
@@ -153,7 +181,6 @@ async def handle_random_response(message: Message):
     if message.chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
         return
 
-    # Пропускаем команды, чтобы бот не триггерился на случайные команды
     if message.text and message.text.startswith("/"):
         return
 
@@ -162,9 +189,7 @@ async def handle_random_response(message: Message):
     
     if chance < CURRENT_THRESHOLD:
         chat_id = message.chat.id
-        # Если история пуста, берем текущее сообщение (так как middleware его уже добавил, если оно не команда)
         if chat_id not in chat_histories:
-             # На всякий случай, если middleware сработал позже или рассинхрон
              return 
 
         context_string = "\n".join(chat_histories[chat_id]) + "\n"
