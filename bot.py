@@ -64,7 +64,7 @@ async def make_api_request(context_string: str) -> str | None:
                 if response.status == 200:
                     data = await response.json()
                     
-                    text_resp = data if isinstance(data, str) else data.get("response") or str(data)
+                    text_resp = data if isinstance(data, str) else data.get("generated_text") or str(data)
                     logger.debug(f"Parsed API response: {text_resp[:50]}...")
                     return text_resp
                 else:
