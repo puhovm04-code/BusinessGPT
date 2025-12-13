@@ -22,7 +22,7 @@ USER_MAPPING = {
     1035739386: "Вован Крюк"
 }
 
-# Имя бота для вырезания из текста (должно совпадать с реальным юзернеймом без @)
+# Имя бота (без @)
 BOT_USERNAME = "businessgpt_text_bot"
 
 logging.basicConfig(level=logging.INFO)
@@ -49,17 +49,14 @@ class HistoryMiddleware(BaseMiddleware):
         if isinstance(event, Message) and event.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
             text = event.text or event.caption or ""
 
-            # 1. Игнорируем команды, начинающиеся с /
+            # Игнорируем команды
             if text and not text.strip().startswith("/"):
                 
-                # 2. Вырезаем тег бота из текста (@botname), чтобы не засорять контекст
-                # re.IGNORECASE позволяет удалять и @BusinessGPT_text_bot и @businessgpt_text_bot
+                # Вырезаем тег бота (@botname) из текста истории
                 clean_text = re.sub(f"@{BOT_USERNAME}", "", text, flags=re.IGNORECASE).strip()
-                
-                # Убираем двойные пробелы, если они остались после удаления тега
                 clean_text = re.sub(r'\s+', ' ', clean_text)
 
-                if clean_text: # Сохраняем, только если остался текст
+                if clean_text:
                     chat_id = event.chat.id
                     user_id = event.from_user.id
                     user_name = USER_MAPPING.get(user_id, event.from_user.full_name)
@@ -168,50 +165,51 @@ async def handle_messages(message: Message):
     if message.chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
         return
 
-    # Игнорируем команды
     if message.text and message.text.strip().startswith("/"):
         return
 
     chat_id = message.chat.id
     text = message.text or ""
     
-    # --- ЛОГИКА ТРИГГЕРА ---
-    should_reply = False
+    # Определяем ТИП триггера: None, 'forced' (реплай/тег) или 'random'
+    trigger_type = None
     
-    # 1. Проверяем, является ли сообщение ответом (reply) на сообщение бота
-    # message.bot.id вернет ID текущего бота
+    # 1. Проверяем Reply (Ответ на сообщение бота)
     bot_id = message.bot.id
     if message.reply_to_message and message.reply_to_message.from_user.id == bot_id:
-        should_reply = True
+        trigger_type = "forced"
         logger.info("Trigger: Reply to bot")
 
-    # 2. Проверяем, тегнули ли бота (@businessgpt_text_bot)
+    # 2. Проверяем Mention (Тег бота)
     elif f"@{BOT_USERNAME}" in text.lower():
-        should_reply = True
+        trigger_type = "forced"
         logger.info("Trigger: Mention of bot")
 
-    # 3. Если не тегнули и не реплай, используем рандом
+    # 3. Проверяем Random (Порог вероятности)
     else:
         chance = random.random()
         logger.info(f"Chance: {chance:.4f} / Threshold: {CURRENT_THRESHOLD}")
         if chance < CURRENT_THRESHOLD:
-            should_reply = True
+            trigger_type = "random"
 
     # --- ГЕНЕРАЦИЯ ---
-    if should_reply:
-        # Если история пуста, бот не может сгенерировать контекст
+    if trigger_type:
         if chat_id not in chat_histories or not chat_histories[chat_id]:
-             # Если сообщение содержит только тег и история пуста, можно ответить заглушкой или промолчать
              return 
 
         context_string = "\n".join(chat_histories[chat_id]) + "\n"
         
-        # Показываем статус "печатает..."
         await message.bot.send_chat_action(chat_id, "typing")
         
         result = await make_api_request(context_string)
         
         if result:
-            # Отвечаем реплаем на сообщение, которое стриггерило бота
-            await message.reply(result)
+            # ЛОГИКА ОТВЕТА:
+            if trigger_type == "forced":
+                # Если обратились к боту — отвечаем с reply
+                await message.reply(result)
+            else:
+                # Если рандом — просто пишем в чат
+                await message.answer(result)
+            
             chat_histories[chat_id].append(f"[BOT]: {result}")
