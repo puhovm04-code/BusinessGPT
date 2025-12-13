@@ -2,7 +2,7 @@ import os
 import logging
 import random
 import aiohttp
-import re  # Для регулярных выражений
+import re
 from collections import deque
 from typing import Callable, Dict, Any, Awaitable
 
@@ -22,6 +22,9 @@ USER_MAPPING = {
     1035739386: "Вован Крюк"
 }
 
+# Имя бота для вырезания из текста (должно совпадать с реальным юзернеймом без @)
+BOT_USERNAME = "businessgpt_text_bot"
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -35,7 +38,7 @@ logger.info(f"ML_MODEL_URL: {ML_MODEL_URL}")
 
 chat_histories = {}
 
-# --- MIDDLEWARE ---
+# --- MIDDLEWARE (ИСТОРИЯ + ОЧИСТКА ОТ ТЕГОВ) ---
 class HistoryMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -46,37 +49,45 @@ class HistoryMiddleware(BaseMiddleware):
         if isinstance(event, Message) and event.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
             text = event.text or event.caption or ""
 
-            # Игнорируем команды при записи в историю
+            # 1. Игнорируем команды, начинающиеся с /
             if text and not text.strip().startswith("/"):
-                chat_id = event.chat.id
-                user_id = event.from_user.id
-                user_name = USER_MAPPING.get(user_id, event.from_user.full_name)
                 
-                if chat_id not in chat_histories:
-                    chat_histories[chat_id] = deque(maxlen=10)
+                # 2. Вырезаем тег бота из текста (@botname), чтобы не засорять контекст
+                # re.IGNORECASE позволяет удалять и @BusinessGPT_text_bot и @businessgpt_text_bot
+                clean_text = re.sub(f"@{BOT_USERNAME}", "", text, flags=re.IGNORECASE).strip()
                 
-                formatted_line = f"[{user_name}]: {text}"
-                chat_histories[chat_id].append(formatted_line)
-                logger.debug(f"Saved to history: {formatted_line}")
+                # Убираем двойные пробелы, если они остались после удаления тега
+                clean_text = re.sub(r'\s+', ' ', clean_text)
+
+                if clean_text: # Сохраняем, только если остался текст
+                    chat_id = event.chat.id
+                    user_id = event.from_user.id
+                    user_name = USER_MAPPING.get(user_id, event.from_user.full_name)
+                    
+                    if chat_id not in chat_histories:
+                        chat_histories[chat_id] = deque(maxlen=10)
+                    
+                    formatted_line = f"[{user_name}]: {clean_text}"
+                    chat_histories[chat_id].append(formatted_line)
+                    logger.debug(f"Saved to history: {formatted_line}")
 
         return await handler(event, data)
 
 router.message.middleware(HistoryMiddleware())
 
 
-# --- ФУНКЦИЯ ОЧИСТКИ (ЧТОБЫ ОСТАЛАСЬ 1 СТРОКА БЕЗ НИКА) ---
+# --- ФУНКЦИЯ ОЧИСТКИ ОТВЕТА МОДЕЛИ ---
 def clean_model_output(full_response: str, input_context: str) -> str | None:
     if not full_response:
         return None
 
-    # 1. Если модель вернула исходный текст в начале — отрезаем его
-    # Мы не трогаем вход, мы просто убираем его копию из выхода
+    # Отрезаем повтор входного контекста
     if full_response.startswith(input_context):
         generated_only = full_response[len(input_context):]
     else:
         generated_only = full_response
 
-    # 2. Разбиваем на строки и берем ПОСЛЕДНЮЮ непустую
+    # Берем последнюю строку
     lines = [line.strip() for line in generated_only.split('\n') if line.strip()]
     
     if not lines:
@@ -84,8 +95,7 @@ def clean_model_output(full_response: str, input_context: str) -> str | None:
     
     last_line = lines[-1]
 
-    # 3. Регулярка: удаляем "[Любой Текст]: " в начале строки
-    # Пример: "[Александр Блок]: Привет" -> "Привет"
+    # Удаляем "[Имя]: " из начала строки
     cleaned_line = re.sub(r"^\[.*?\]:\s*", "", last_line)
 
     return cleaned_line if cleaned_line else None
@@ -118,7 +128,6 @@ async def make_api_request(context_string: str) -> str | None:
                     data = await response.json()
                     raw_text = data.get("generated_text", "")
                     
-                    # ПРИМЕНЯЕМ ФИЛЬТР
                     final_text = clean_model_output(raw_text, context_string)
                     return final_text
                 else:
@@ -130,7 +139,7 @@ async def make_api_request(context_string: str) -> str | None:
         return None
 
 
-# --- КОМАНДЫ ---
+# --- КОМАНДЫ УПРАВЛЕНИЯ ---
 
 @router.message(Command("threshold"))
 async def set_threshold(message: Message, command: CommandObject):
@@ -153,49 +162,56 @@ async def set_threshold(message: Message, command: CommandObject):
         await message.reply("❌ Некорректное число")
 
 
-@router.message(Command("generate"))
-async def force_generate(message: Message):
-    chat_id = message.chat.id
-    
-    if chat_id not in chat_histories or not chat_histories[chat_id]:
-        await message.reply("История пуста. Напишите что-нибудь.")
-        return
-
-    context_string = "\n".join(chat_histories[chat_id]) + "\n"
-    
-    await message.bot.send_chat_action(chat_id, "typing")
-    result = await make_api_request(context_string)
-
-    if result:
-        await message.reply(result)
-        # В историю добавляем чистый ответ бота
-        chat_histories[chat_id].append(f"[BOT]: {result}")
-    else:
-        await message.reply("Не удалось сгенерировать ответ.")
-
-
-# --- ОБРАБОТКА РАНДОМА ---
-
+# --- ЕДИНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ ---
 @router.message()
-async def handle_random_response(message: Message):
+async def handle_messages(message: Message):
     if message.chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
         return
 
-    if message.text and message.text.startswith("/"):
+    # Игнорируем команды
+    if message.text and message.text.strip().startswith("/"):
         return
 
-    chance = random.random()
-    logger.info(f"Chance: {chance:.4f} / Threshold: {CURRENT_THRESHOLD}")
+    chat_id = message.chat.id
+    text = message.text or ""
     
-    if chance < CURRENT_THRESHOLD:
-        chat_id = message.chat.id
-        if chat_id not in chat_histories:
+    # --- ЛОГИКА ТРИГГЕРА ---
+    should_reply = False
+    
+    # 1. Проверяем, является ли сообщение ответом (reply) на сообщение бота
+    # message.bot.id вернет ID текущего бота
+    bot_id = message.bot.id
+    if message.reply_to_message and message.reply_to_message.from_user.id == bot_id:
+        should_reply = True
+        logger.info("Trigger: Reply to bot")
+
+    # 2. Проверяем, тегнули ли бота (@businessgpt_text_bot)
+    elif f"@{BOT_USERNAME}" in text.lower():
+        should_reply = True
+        logger.info("Trigger: Mention of bot")
+
+    # 3. Если не тегнули и не реплай, используем рандом
+    else:
+        chance = random.random()
+        logger.info(f"Chance: {chance:.4f} / Threshold: {CURRENT_THRESHOLD}")
+        if chance < CURRENT_THRESHOLD:
+            should_reply = True
+
+    # --- ГЕНЕРАЦИЯ ---
+    if should_reply:
+        # Если история пуста, бот не может сгенерировать контекст
+        if chat_id not in chat_histories or not chat_histories[chat_id]:
+             # Если сообщение содержит только тег и история пуста, можно ответить заглушкой или промолчать
              return 
 
         context_string = "\n".join(chat_histories[chat_id]) + "\n"
         
+        # Показываем статус "печатает..."
+        await message.bot.send_chat_action(chat_id, "typing")
+        
         result = await make_api_request(context_string)
         
         if result:
-            await message.answer(result)
+            # Отвечаем реплаем на сообщение, которое стриггерило бота
+            await message.reply(result)
             chat_histories[chat_id].append(f"[BOT]: {result}")
