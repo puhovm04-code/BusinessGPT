@@ -11,7 +11,6 @@ from aiogram.enums import ChatType
 router = Router()
 
 # --- КОНФИГУРАЦИЯ ---
-
 # 1. СЮДА ВПИШИ ID ПОЛЬЗОВАТЕЛЕЙ (числа).
 # Если ID нет в списке, бот будет использовать имя из профиля Telegram.
 USER_MAPPING = {
