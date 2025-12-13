@@ -4,6 +4,8 @@ import random
 import aiohttp
 import re
 import asyncio
+import time
+from datetime import datetime
 from collections import deque
 from typing import Callable, Dict, Any, Awaitable
 
@@ -24,9 +26,12 @@ USER_MAPPING = {
 }
 
 BOT_USERNAME = "businessgpt_text_bot"
-MAX_INPUT_LENGTH = 800  # <--- ОГРАНИЧЕНИЕ СИМВОЛОВ
+MAX_INPUT_LENGTH = 800  # Лимит символов
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 CURRENT_THRESHOLD = float(os.getenv("THRESHOLD", "0.2"))
@@ -36,11 +41,10 @@ ADMIN_IDS = [int(x) for x in admin_ids_str.split(",") if x.strip().isdigit()]
 
 logger.info(f"Initial THRESHOLD: {CURRENT_THRESHOLD}")
 logger.info(f"ML_MODEL_URL: {ML_MODEL_URL}")
-logger.info(f"Max Input Length: {MAX_INPUT_LENGTH}")
 
 chat_histories = {}
 
-# Глобальная блокировка, чтобы запросы уходили по очереди
+# Блокировка для очереди запросов
 api_lock = asyncio.Lock()
 
 # --- MIDDLEWARE ---
@@ -54,12 +58,12 @@ class HistoryMiddleware(BaseMiddleware):
         if isinstance(event, Message) and event.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
             text = event.text or event.caption or ""
 
-            # --- ОБРЕЗКА ТЕКСТА ДЛЯ ИСТОРИИ ---
+            # 1. Обрезка входящего текста
             if len(text) > MAX_INPUT_LENGTH:
                 text = text[:MAX_INPUT_LENGTH]
 
             if text and not text.strip().startswith("/"):
-                # Вырезаем тег бота
+                # Вырезаем тег бота и лишние пробелы
                 clean_text = re.sub(f"@{BOT_USERNAME}", "", text, flags=re.IGNORECASE).strip()
                 clean_text = re.sub(r'\s+', ' ', clean_text)
 
@@ -96,6 +100,7 @@ def clean_model_output(full_response: str, input_context: str) -> str | None:
         return None
     
     last_line = lines[-1]
+    # Убираем возможные артефакты в начале строки типа "[Bot]:"
     cleaned_line = re.sub(r"^\[.*?\]:\s*", "", last_line)
 
     return cleaned_line if cleaned_line else None
@@ -111,31 +116,36 @@ async def make_api_request(context_string: str) -> str | None:
     if not url.endswith("generate"):
         url = f"{url.rstrip('/')}/generate"
 
+    # Настройка таймаутов: connect - быстро отвалиться если сервер лежит
+    # total - ждать генерации не более 25 сек
+    timeout_settings = aiohttp.ClientTimeout(total=25, connect=5)
+
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=timeout_settings) as session:
             payload = {"prompt": context_string}
             
-            logger.info(f"POST Request to: {url}")
+            logger.info(f"POST Request sending... (Queue size: Locked={api_lock.locked()})")
+            start_time = time.time()
             
             async with session.post(
                 url,
                 headers={"Content-Type": "application/json"},
-                json=payload,
-                timeout=60 
+                json=payload
             ) as response:
                 
+                duration = time.time() - start_time
+                logger.info(f"Request finished in {duration:.2f}s with status {response.status}")
+
                 if response.status == 200:
                     data = await response.json()
                     raw_text = data.get("generated_text", "")
                     return clean_model_output(raw_text, context_string)
                 else:
                     logger.error(f"API Error. Status: {response.status}")
-                    text = await response.text()
-                    logger.error(f"Response text: {text}")
                     return None
                     
     except asyncio.TimeoutError:
-        logger.error("API Error: Timeout (Server took too long to respond)")
+        logger.error("API Error: Timeout (Server took >25s or unreachable)")
         return None
     except Exception as e:
         logger.error(f"API Connection Error: {e}")
@@ -173,16 +183,21 @@ async def handle_messages(message: Message):
     if message.text and message.text.strip().startswith("/"):
         return
 
-    chat_id = message.chat.id
-    text = message.text or ""
+    # --- ЗАЩИТА ОТ СТАРЫХ СООБЩЕНИЙ ---
+    # Если сообщение старше 120 секунд, игнорируем его (чтобы бот не отвечал на историю после рестарта)
+    msg_date = message.date
+    if (datetime.now(msg_date.tzinfo) - msg_date).total_seconds() > 120:
+        logger.warning(f"Skipping old message from {msg_date}")
+        return
 
-    # --- ОБРЕЗКА ТЕКСТА ДЛЯ ПРОВЕРКИ ТРИГГЕРОВ ---
+    text = message.text or ""
+    # Обрезаем текст и тут для проверки триггеров
     if len(text) > MAX_INPUT_LENGTH:
         text = text[:MAX_INPUT_LENGTH]
-    
+
     trigger_type = None
-    
     bot_id = message.bot.id
+    
     # 1. Reply
     if message.reply_to_message and message.reply_to_message.from_user.id == bot_id:
         trigger_type = "forced"
@@ -195,25 +210,37 @@ async def handle_messages(message: Message):
 
     # 3. Random
     else:
+        # ПРОВЕРКА БЛОКИРОВКИ СРАЗУ
+        # Если бот уже занят генерацией, мы даже не кидаем кубик для рандома, чтобы не спамить в логи
+        if api_lock.locked():
+            return 
+
         chance = random.random()
-        logger.info(f"Chance: {chance:.4f} / Threshold: {CURRENT_THRESHOLD}")
         if chance < CURRENT_THRESHOLD:
+            logger.info(f"Random trigger hit! ({chance:.4f} < {CURRENT_THRESHOLD})")
             trigger_type = "random"
+        else:
+            logger.info(f"Random skip ({chance:.4f} >= {CURRENT_THRESHOLD})")
 
     # --- ГЕНЕРАЦИЯ ---
     if trigger_type:
+        # Двойная проверка для Random: если блокировка занята - выход
         if trigger_type == "random" and api_lock.locked():
-            logger.info("Skipping random generation due to high load (Lock is busy)")
+            logger.info("Skipping random generation (Lock busy)")
             return
 
-        if chat_id not in chat_histories or not chat_histories[chat_id]:
+        if message.chat.id not in chat_histories or not chat_histories[message.chat.id]:
              return 
 
-        context_string = "\n".join(chat_histories[chat_id]) + "\n"
+        context_string = "\n".join(chat_histories[message.chat.id]) + "\n"
         
-        await message.bot.send_chat_action(chat_id, "typing")
+        # Визуальная реакция только для forced, чтобы не спамить "печатает" постоянно
+        if trigger_type == "forced":
+            await message.bot.send_chat_action(message.chat.id, "typing")
         
+        # Блокировка
         async with api_lock:
+            # Внутри блокировки проверяем ещё раз, не прошло ли слишком много времени
             result = await make_api_request(context_string)
         
         if result:
@@ -222,4 +249,4 @@ async def handle_messages(message: Message):
             else:
                 await message.answer(result)
             
-            chat_histories[chat_id].append(f"[BOT]: {result}")
+            chat_histories[message.chat.id].append(f"[BOT]: {result}")
