@@ -3,6 +3,7 @@ import logging
 import random
 import aiohttp
 import re
+import asyncio  # Добавили для блокировки
 from collections import deque
 from typing import Callable, Dict, Any, Awaitable
 
@@ -22,7 +23,6 @@ USER_MAPPING = {
     1035739386: "Вован Крюк"
 }
 
-# Имя бота (без @)
 BOT_USERNAME = "businessgpt_text_bot"
 
 logging.basicConfig(level=logging.INFO)
@@ -38,7 +38,10 @@ logger.info(f"ML_MODEL_URL: {ML_MODEL_URL}")
 
 chat_histories = {}
 
-# --- MIDDLEWARE (ИСТОРИЯ + ОЧИСТКА ОТ ТЕГОВ) ---
+# Глобальная блокировка, чтобы запросы уходили по очереди
+api_lock = asyncio.Lock()
+
+# --- MIDDLEWARE ---
 class HistoryMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -49,10 +52,8 @@ class HistoryMiddleware(BaseMiddleware):
         if isinstance(event, Message) and event.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
             text = event.text or event.caption or ""
 
-            # Игнорируем команды
             if text and not text.strip().startswith("/"):
-                
-                # Вырезаем тег бота (@botname) из текста истории
+                # Вырезаем тег бота
                 clean_text = re.sub(f"@{BOT_USERNAME}", "", text, flags=re.IGNORECASE).strip()
                 clean_text = re.sub(r'\s+', ' ', clean_text)
 
@@ -73,26 +74,22 @@ class HistoryMiddleware(BaseMiddleware):
 router.message.middleware(HistoryMiddleware())
 
 
-# --- ФУНКЦИЯ ОЧИСТКИ ОТВЕТА МОДЕЛИ ---
+# --- ФУНКЦИЯ ОЧИСТКИ ---
 def clean_model_output(full_response: str, input_context: str) -> str | None:
     if not full_response:
         return None
 
-    # Отрезаем повтор входного контекста
     if full_response.startswith(input_context):
         generated_only = full_response[len(input_context):]
     else:
         generated_only = full_response
 
-    # Берем последнюю строку
     lines = [line.strip() for line in generated_only.split('\n') if line.strip()]
     
     if not lines:
         return None
     
     last_line = lines[-1]
-
-    # Удаляем "[Имя]: " из начала строки
     cleaned_line = re.sub(r"^\[.*?\]:\s*", "", last_line)
 
     return cleaned_line if cleaned_line else None
@@ -114,30 +111,33 @@ async def make_api_request(context_string: str) -> str | None:
             
             logger.info(f"POST Request to: {url}")
             
+            # Увеличили timeout до 60 секунд, чтобы не падало при очереди
             async with session.post(
                 url,
                 headers={"Content-Type": "application/json"},
                 json=payload,
-                timeout=20
+                timeout=60 
             ) as response:
                 
                 if response.status == 200:
                     data = await response.json()
                     raw_text = data.get("generated_text", "")
-                    
-                    final_text = clean_model_output(raw_text, context_string)
-                    return final_text
+                    return clean_model_output(raw_text, context_string)
                 else:
                     logger.error(f"API Error. Status: {response.status}")
-                    logger.error(f"Response text: {await response.text()}")
+                    text = await response.text()
+                    logger.error(f"Response text: {text}")
                     return None
+                    
+    except asyncio.TimeoutError:
+        logger.error("API Error: Timeout (Server took too long to respond)")
+        return None
     except Exception as e:
         logger.error(f"API Connection Error: {e}")
         return None
 
 
-# --- КОМАНДЫ УПРАВЛЕНИЯ ---
-
+# --- КОМАНДЫ ---
 @router.message(Command("threshold"))
 async def set_threshold(message: Message, command: CommandObject):
     global CURRENT_THRESHOLD
@@ -159,7 +159,7 @@ async def set_threshold(message: Message, command: CommandObject):
         await message.reply("❌ Некорректное число")
 
 
-# --- ЕДИНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ ---
+# --- ОБРАБОТЧИК СООБЩЕНИЙ ---
 @router.message()
 async def handle_messages(message: Message):
     if message.chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
@@ -171,21 +171,20 @@ async def handle_messages(message: Message):
     chat_id = message.chat.id
     text = message.text or ""
     
-    # Определяем ТИП триггера: None, 'forced' (реплай/тег) или 'random'
     trigger_type = None
     
-    # 1. Проверяем Reply (Ответ на сообщение бота)
     bot_id = message.bot.id
+    # 1. Reply
     if message.reply_to_message and message.reply_to_message.from_user.id == bot_id:
         trigger_type = "forced"
         logger.info("Trigger: Reply to bot")
 
-    # 2. Проверяем Mention (Тег бота)
+    # 2. Mention
     elif f"@{BOT_USERNAME}" in text.lower():
         trigger_type = "forced"
         logger.info("Trigger: Mention of bot")
 
-    # 3. Проверяем Random (Порог вероятности)
+    # 3. Random
     else:
         chance = random.random()
         logger.info(f"Chance: {chance:.4f} / Threshold: {CURRENT_THRESHOLD}")
@@ -194,6 +193,12 @@ async def handle_messages(message: Message):
 
     # --- ГЕНЕРАЦИЯ ---
     if trigger_type:
+        # Если это рандом, но сервер занят другим запросом - пропускаем, чтобы не вешать очередь
+        # Если forced (reply/mention) - ждем очереди
+        if trigger_type == "random" and api_lock.locked():
+            logger.info("Skipping random generation due to high load (Lock is busy)")
+            return
+
         if chat_id not in chat_histories or not chat_histories[chat_id]:
              return 
 
@@ -201,15 +206,14 @@ async def handle_messages(message: Message):
         
         await message.bot.send_chat_action(chat_id, "typing")
         
-        result = await make_api_request(context_string)
+        # Используем LOCK, чтобы запросы шли строго по одному
+        async with api_lock:
+            result = await make_api_request(context_string)
         
         if result:
-            # ЛОГИКА ОТВЕТА:
             if trigger_type == "forced":
-                # Если обратились к боту — отвечаем с reply
                 await message.reply(result)
             else:
-                # Если рандом — просто пишем в чат
                 await message.answer(result)
             
             chat_histories[chat_id].append(f"[BOT]: {result}")
