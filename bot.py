@@ -84,29 +84,38 @@ class HistoryMiddleware(BaseMiddleware):
 router.message.middleware(HistoryMiddleware())
 
 
-# --- ФУНКЦИЯ ОЧИСТКИ ---
+# --- ФУНКЦИЯ ОЧИСТКИ (ИСПРАВЛЕННАЯ) ---
 def clean_model_output(full_response: str, input_context: str) -> str | None:
     if not full_response:
         return None
 
+    # 1. Отделяем сгенерированное от контекста
     if full_response.startswith(input_context):
         generated_only = full_response[len(input_context):]
     else:
         generated_only = full_response
 
-    lines = [line.strip() for line in generated_only.split('\n') if line.strip()]
+    # 2. Убираем пробелы по краям
+    generated_only = generated_only.strip()
     
-    if not lines:
+    if not generated_only:
         return None
+
+    # 3. Фильтрация: убираем строки, похожие на теги имен, если они в начале
+    # Например, если модель начала с "[Bot]: Привет", убираем "[Bot]:"
+    clean_text = re.sub(r"^\[.*?\]:\s*", "", generated_only)
     
-    last_line = lines[-1]
-    # Убираем возможные артефакты в начале строки типа "[Bot]:"
-    cleaned_line = re.sub(r"^\[.*?\]:\s*", "", last_line)
+    # 4. Если модель начала галлюцинировать продолжение диалога за других,
+    # обрезаем текст до первого вхождения переноса строки с тегом `[...]`
+    # (Это предотвратит попадание в ответ реплик, которые модель придумала за юзера)
+    split_match = re.search(r"\n\[.*?\]:", clean_text)
+    if split_match:
+        clean_text = clean_text[:split_match.start()]
 
-    return cleaned_line if cleaned_line else None
+    return clean_text.strip() if clean_text.strip() else None
 
 
-# --- ЗАПРОС К API ---
+# --- ЗАПРОС К API (С ОТЛАДКОЙ) ---
 async def make_api_request(context_string: str) -> str | None:
     if not ML_MODEL_URL:
         logger.error("ML_MODEL_URL is not set!")
@@ -116,8 +125,6 @@ async def make_api_request(context_string: str) -> str | None:
     if not url.endswith("generate"):
         url = f"{url.rstrip('/')}/generate"
 
-    # Настройка таймаутов: connect - быстро отвалиться если сервер лежит
-    # total - ждать генерации не более 25 сек
     timeout_settings = aiohttp.ClientTimeout(total=25, connect=5)
 
     try:
@@ -139,7 +146,20 @@ async def make_api_request(context_string: str) -> str | None:
                 if response.status == 200:
                     data = await response.json()
                     raw_text = data.get("generated_text", "")
-                    return clean_model_output(raw_text, context_string)
+                    
+                    # --- ВАЖНЫЙ ЛОГ ДЛЯ ОТЛАДКИ ---
+                    # Показывает, что реально вернула модель ДО очистки
+                    # Ограничим вывод 200 символами, чтобы не засорять логи
+                    log_preview = raw_text[len(context_string):].strip()
+                    logger.info(f"Model RAW output (truncated): {log_preview[:200]}...") 
+                    # ------------------------------
+
+                    cleaned = clean_model_output(raw_text, context_string)
+                    
+                    if not cleaned:
+                        logger.warning("⚠️ Response was empty after cleaning!")
+                    
+                    return cleaned
                 else:
                     logger.error(f"API Error. Status: {response.status}")
                     return None
@@ -150,7 +170,6 @@ async def make_api_request(context_string: str) -> str | None:
     except Exception as e:
         logger.error(f"API Connection Error: {e}")
         return None
-
 
 # --- КОМАНДЫ ---
 @router.message(Command("threshold"))
