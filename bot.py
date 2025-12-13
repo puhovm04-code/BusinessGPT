@@ -3,7 +3,7 @@ import logging
 import random
 import aiohttp
 import re
-import asyncio  # Добавили для блокировки
+import asyncio
 from collections import deque
 from typing import Callable, Dict, Any, Awaitable
 
@@ -24,6 +24,7 @@ USER_MAPPING = {
 }
 
 BOT_USERNAME = "businessgpt_text_bot"
+MAX_INPUT_LENGTH = 800  # <--- ОГРАНИЧЕНИЕ СИМВОЛОВ
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ ADMIN_IDS = [int(x) for x in admin_ids_str.split(",") if x.strip().isdigit()]
 
 logger.info(f"Initial THRESHOLD: {CURRENT_THRESHOLD}")
 logger.info(f"ML_MODEL_URL: {ML_MODEL_URL}")
+logger.info(f"Max Input Length: {MAX_INPUT_LENGTH}")
 
 chat_histories = {}
 
@@ -51,6 +53,10 @@ class HistoryMiddleware(BaseMiddleware):
     ) -> Any:
         if isinstance(event, Message) and event.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
             text = event.text or event.caption or ""
+
+            # --- ОБРЕЗКА ТЕКСТА ДЛЯ ИСТОРИИ ---
+            if len(text) > MAX_INPUT_LENGTH:
+                text = text[:MAX_INPUT_LENGTH]
 
             if text and not text.strip().startswith("/"):
                 # Вырезаем тег бота
@@ -111,7 +117,6 @@ async def make_api_request(context_string: str) -> str | None:
             
             logger.info(f"POST Request to: {url}")
             
-            # Увеличили timeout до 60 секунд, чтобы не падало при очереди
             async with session.post(
                 url,
                 headers={"Content-Type": "application/json"},
@@ -170,6 +175,10 @@ async def handle_messages(message: Message):
 
     chat_id = message.chat.id
     text = message.text or ""
+
+    # --- ОБРЕЗКА ТЕКСТА ДЛЯ ПРОВЕРКИ ТРИГГЕРОВ ---
+    if len(text) > MAX_INPUT_LENGTH:
+        text = text[:MAX_INPUT_LENGTH]
     
     trigger_type = None
     
@@ -193,8 +202,6 @@ async def handle_messages(message: Message):
 
     # --- ГЕНЕРАЦИЯ ---
     if trigger_type:
-        # Если это рандом, но сервер занят другим запросом - пропускаем, чтобы не вешать очередь
-        # Если forced (reply/mention) - ждем очереди
         if trigger_type == "random" and api_lock.locked():
             logger.info("Skipping random generation due to high load (Lock is busy)")
             return
@@ -206,7 +213,6 @@ async def handle_messages(message: Message):
         
         await message.bot.send_chat_action(chat_id, "typing")
         
-        # Используем LOCK, чтобы запросы шли строго по одному
         async with api_lock:
             result = await make_api_request(context_string)
         
