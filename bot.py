@@ -17,10 +17,9 @@ from aiohttp import web
 
 # --- КОНФИГУРАЦИЯ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-# ID чата, в котором работает бот (строго один чат)
 ALLOWED_CHAT_ID = -1002576074706
 
-# Маппинг известных ID (добавляй сюда найденных в логах людей)
+# Маппинг известных ID
 USER_MAPPING = {
     814759080: "A. H.",
     485898893: "Старый Мельник",
@@ -32,6 +31,10 @@ USER_MAPPING = {
     1878550901: "Егориус"
     # Остальных добавишь, посмотрев в логи с пометкой [ID LOG]
 }
+
+# Выбираем "дефолтную" личность для замены [BOT]. 
+# Берём первого из списка (A. H.) или любого другого, кого знает модель.
+DEFAULT_PERSONA = list(USER_MAPPING.values())[0] 
 
 BOT_USERNAME = "businessgpt_text_bot"
 MAX_INPUT_LENGTH = 800
@@ -50,6 +53,7 @@ ADMIN_IDS = [int(x) for x in admin_ids_str.split(",") if x.strip().isdigit()]
 logger.info(f"Initial THRESHOLD: {CURRENT_THRESHOLD}")
 logger.info(f"ML_MODEL_URL: {ML_MODEL_URL}")
 logger.info(f"WORKING ONLY IN CHAT ID: {ALLOWED_CHAT_ID}")
+logger.info(f"DEFAULT PERSONA FOR BOT REPLACEMENT: {DEFAULT_PERSONA}")
 
 chat_histories = {}
 api_lock = asyncio.Lock()
@@ -71,7 +75,7 @@ async def start_dummy_server():
     await site.start()
     logger.info(f"✅ Dummy web server started on port {port}")
 
-# --- MIDDLEWARE (Обработка входящих сообщений и истории) ---
+# --- MIDDLEWARE ---
 class HistoryMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -82,16 +86,13 @@ class HistoryMiddleware(BaseMiddleware):
         if not isinstance(event, Message):
             return await handler(event, data)
 
-        # 1. ПРОВЕРКА ЧАТА
         if event.chat.id != ALLOWED_CHAT_ID:
             return
 
-        # 2. ЛОГИРОВАНИЕ ID УЧАСТНИКОВ
         user = event.from_user
         if user:
             logger.info(f"[ID LOG] User: {user.full_name} | ID: {user.id} | Username: @{user.username}")
 
-        # Сбор истории
         if event.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
             text = event.text or event.caption or ""
 
@@ -105,7 +106,6 @@ class HistoryMiddleware(BaseMiddleware):
                 if clean_text:
                     chat_id = event.chat.id
                     user_id = user.id
-                    # Если ID нет в базе, берем имя из профиля
                     user_name = USER_MAPPING.get(user_id, user.full_name)
                     
                     if chat_id not in chat_histories:
@@ -114,7 +114,6 @@ class HistoryMiddleware(BaseMiddleware):
                     formatted_line = f"[{user_name}]: {clean_text}"
                     chat_histories[chat_id].append(formatted_line)
                     
-                    # 5. ЛОГИРОВАНИЕ ОЧЕРЕДИ
                     current_queue = list(chat_histories[chat_id])
                     logger.info(f"[QUEUE DEBUG] Updated context ({len(current_queue)} lines):\n" + "\n".join(current_queue))
 
@@ -122,31 +121,21 @@ class HistoryMiddleware(BaseMiddleware):
 
 router.message.middleware(HistoryMiddleware())
 
-# --- ФУНКЦИЯ ОЧИСТКИ ОТВЕТА ---
+# --- ОБРАБОТКА ОТВЕТА МОДЕЛИ ---
 def process_model_output(full_response: str, input_context: str) -> Tuple[str | None, str | None]:
-    """
-    Возвращает: (чистый_текст_для_чата, строка_для_истории)
-    """
     if not full_response:
         return None, None
 
-    # Отрезаем контекст, который мы посылали
-    # Проверка на точное совпадение начала
     if full_response.startswith(input_context):
         generated_only = full_response[len(input_context):]
     else:
-        # Если модель чуть исказила начало, пробуем найти конец контекста
-        # Но обычно startswith работает корректно, если промпт передан верно
         generated_only = full_response
 
     generated_only = generated_only.strip()
     if not generated_only:
         return None, None
 
-    # Нам нужна ТОЛЬКО первая строка до следующего переноса строки, где начинается новое имя
-    # Например: "[Саня]: Привет\n[Влад]: Пока" -> берем только "[Саня]: Привет"
-    
-    # Ищем, где начинается следующее сообщение (новая строка + квадратная скобка)
+    # Берем только первую строку
     split_match = re.search(r"\n\[.*?\]:", generated_only)
     if split_match:
         first_message_block = generated_only[:split_match.start()].strip()
@@ -156,20 +145,19 @@ def process_model_output(full_response: str, input_context: str) -> Tuple[str | 
     if not first_message_block:
         return None, None
 
-    # Разбираем полученную строку: "[Имя]: Текст"
     match_prefix = re.match(r"^\[(.*?)\]:\s*(.*)", first_message_block)
     
     if match_prefix:
         persona_name = match_prefix.group(1)
         clean_text = match_prefix.group(2).strip()
-        # Сохраняем как есть (со скобками)
         history_line = f"[{persona_name}]: {clean_text}"
         return clean_text, history_line
     else:
-        # Если модель не выдала скобки (как в случае с 'Пока вы это делаете...')
-        # Мы добавляем [BOT], чтобы не ломать структуру очереди для следующих запросов
+        # ВАЖНОЕ ИЗМЕНЕНИЕ: 
+        # Если модель не дала имя, мы НЕ пишем [BOT], а подставляем валидного персонажа
+        # чтобы не портить историю для будущих генераций
         clean_text = first_message_block
-        history_line = f"[BOT]: {clean_text}"
+        history_line = f"[{DEFAULT_PERSONA}]: {clean_text}"
         return clean_text, history_line
 
 # --- ЗАПРОС К API ---
@@ -178,15 +166,21 @@ async def make_api_request(chat_id: int) -> Tuple[str | None, str | None]:
         logger.error("ML_MODEL_URL is not set!")
         return None, None
     
-    # ФОРМИРОВАНИЕ ПРОМПТА (Строгое соответствие требованию)
-    # Собираем строку так, чтобы после КАЖДОГО сообщения был \n
+    # ФОРМИРОВАНИЕ ПРОМПТА
     history_list = list(chat_histories[chat_id])
     context_string = ""
-    for line in history_list:
-        context_string += f"{line}\n"
     
-    # На выходе получается: "[Имя]: Текст\n[Имя2]: Текст2\n"
-
+    for line in history_list:
+        # ВАЖНОЕ ИЗМЕНЕНИЕ:
+        # Проверяем, нет ли в истории [BOT]. Если есть - меняем на валидного персонажа.
+        # Это защищает модель от неизвестного токена.
+        if line.strip().startswith("[BOT]:"):
+            # Заменяем [BOT] на дефолтную персону (например, A. H.) только для запроса
+            clean_line = line.replace("[BOT]:", f"[{DEFAULT_PERSONA}]:", 1)
+            context_string += f"{clean_line}\n"
+        else:
+            context_string += f"{line}\n"
+    
     url = ML_MODEL_URL
     if not url.endswith("generate"):
         url = f"{url.rstrip('/')}/generate"
@@ -205,10 +199,8 @@ async def make_api_request(chat_id: int) -> Tuple[str | None, str | None]:
                 
                 if response.status == 200:
                     data = await response.json()
-                    # Модель возвращает: Промпт + Новое
                     raw_text = data.get("generated_text", "")
                     
-                    # Логирование сырого начала ответа (без промпта) для отладки
                     if raw_text.startswith(context_string):
                         preview = raw_text[len(context_string):].strip()[:50]
                     else:
@@ -260,7 +252,6 @@ async def handle_messages(message: Message):
     if message.text and message.text.strip().startswith("/"):
         return
 
-    # Защита от старых сообщений (более 120 сек)
     if (datetime.now(message.date.tzinfo) - message.date).total_seconds() > 120:
         return
 
@@ -291,7 +282,6 @@ async def handle_messages(message: Message):
             await message.bot.send_chat_action(message.chat.id, "typing")
         
         async with api_lock:
-            # Передаем ID чата, функция сама соберет промпт
             result_text, history_line = await make_api_request(message.chat.id)
         
         if result_text and history_line:
@@ -301,7 +291,6 @@ async def handle_messages(message: Message):
                 else:
                     await message.answer(result_text)
                 
-                # Добавляем в историю (со скобками), чтобы контекст не прерывался
                 chat_histories[message.chat.id].append(history_line)
                 
                 logger.info(f"[QUEUE DEBUG] Added bot response. Context:\n" + "\n".join(chat_histories[message.chat.id]))
