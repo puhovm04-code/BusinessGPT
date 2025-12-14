@@ -43,8 +43,11 @@ logger.info(f"Initial THRESHOLD: {CURRENT_THRESHOLD}")
 logger.info(f"ML_MODEL_URL: {ML_MODEL_URL}")
 
 chat_histories = {}
-api_lock = asyncio.Lock()
 router = Router()
+
+# Очередь сообщений с приоритетами
+# Структура элемента: (priority, timestamp, message_object, trigger_type)
+msg_queue = asyncio.PriorityQueue()
 
 # --- ФЕЙКОВЫЙ СЕРВЕР ДЛЯ RENDER ---
 async def start_dummy_server():
@@ -137,7 +140,7 @@ async def make_api_request(context_string: str) -> str | None:
         async with aiohttp.ClientSession(timeout=timeout_settings) as session:
             payload = {"prompt": context_string}
             
-            logger.info(f"Generating... (Lock state: {api_lock.locked()})")
+            logger.info(f"Generating...")
             start_time = time.time()
             
             async with session.post(url, json=payload) as response:
@@ -162,6 +165,57 @@ async def make_api_request(context_string: str) -> str | None:
     except Exception as e:
         logger.error(f"API Exception: {e}")
         return None
+
+# --- ВОРКЕР ОЧЕРЕДИ ---
+async def queue_worker():
+    """Фоновая задача для обработки очереди сообщений по одному"""
+    logger.info("👷 Queue worker started")
+    while True:
+        try:
+            # Получаем задачу из очереди: (приоритет, время, сообщение, тип_триггера)
+            priority, _, message, trigger_type = await msg_queue.get()
+            
+            chat_id = message.chat.id
+            
+            # Если истории нет, пропускаем
+            if chat_id not in chat_histories or not chat_histories[chat_id]:
+                msg_queue.task_done()
+                continue
+
+            # Собираем контекст (история могла обновиться, пока сообщение лежало в очереди)
+            context_string = "\n".join(chat_histories[chat_id]) + "\n"
+
+            # Показываем "печатает..." только для прямых обращений
+            if trigger_type == "forced":
+                await message.bot.send_chat_action(chat_id, "typing")
+
+            # Делаем запрос к модели
+            result = await make_api_request(context_string)
+
+            if result:
+                try:
+                    # Отправляем ответ
+                    if trigger_type == "forced":
+                        await message.reply(result)
+                    else:
+                        await message.answer(result)
+                    
+                    # ВАЖНО: Добавляем ответ бота в историю, чтобы он учитывался в следующих генерациях
+                    chat_histories[chat_id].append(f"[BOT]: {result}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to send message: {e}")
+            
+            # Отмечаем задачу как выполненную
+            msg_queue.task_done()
+            
+            # Небольшая пауза между сообщениями, чтобы не спамить слишком быстро
+            await asyncio.sleep(1)
+
+        except Exception as e:
+            logger.error(f"Error in queue worker: {e}")
+            # На случай критической ошибки не роняем воркер полностью
+            await asyncio.sleep(1)
 
 # --- КОМАНДЫ ---
 @router.message(Command("threshold"))
@@ -197,54 +251,38 @@ async def handle_messages(message: Message):
     if (datetime.now(message.date.tzinfo) - message.date).total_seconds() > 120:
         return
 
-    # Обрезка текста
     text = message.text or ""
-    if len(text) > MAX_INPUT_LENGTH:
-        text = text[:MAX_INPUT_LENGTH]
-
-    trigger_type = None
     bot_id = message.bot.id
     
-    # Определение триггера
-    if message.reply_to_message and message.reply_to_message.from_user.id == bot_id:
+    # Логика определения триггера
+    is_reply = message.reply_to_message is not None
+    is_reply_to_bot = is_reply and message.reply_to_message.from_user.id == bot_id
+    has_mention = f"@{BOT_USERNAME}" in text.lower()
+
+    trigger_type = None
+    priority = 10  # По умолчанию низкий приоритет
+
+    # 1. Если это реплай, но НЕ боту, и бота НЕ упомянули -> ИГНОРИРУЕМ
+    if is_reply and not is_reply_to_bot and not has_mention:
+        return
+
+    # 2. Определение приоритета и типа
+    if is_reply_to_bot or has_mention:
         trigger_type = "forced"
-    elif f"@{BOT_USERNAME}" in text.lower():
-        trigger_type = "forced"
+        priority = 1  # Высокий приоритет для ответов и упоминаний
     else:
-        # Если бот занят, рандом даже не считаем
-        if api_lock.locked():
-            return
+        # Рандомное срабатывание (только для обычных сообщений)
         if random.random() < CURRENT_THRESHOLD:
             trigger_type = "random"
+            priority = 2  # Приоритет ниже, чем у прямых обращений
 
     if not trigger_type:
         return
 
-    # Проверка блокировки перед запуском
-    if trigger_type == "random" and api_lock.locked():
-        logger.info("Skip random: Busy")
-        return
-
-    # Генерация
-    if message.chat.id in chat_histories and chat_histories[message.chat.id]:
-        context_string = "\n".join(chat_histories[message.chat.id]) + "\n"
-        
-        if trigger_type == "forced":
-            await message.bot.send_chat_action(message.chat.id, "typing")
-        
-        async with api_lock:
-            result = await make_api_request(context_string)
-        
-        if result:
-            try:
-                if trigger_type == "forced":
-                    await message.reply(result)
-                else:
-                    await message.answer(result)
-                
-                chat_histories[message.chat.id].append(f"[BOT]: {result}")
-            except Exception as e:
-                logger.error(f"Failed to send message: {e}")
+    # Добавляем в очередь
+    # Используем time.time() как второй элемент кортежа для сохранения порядка (FIFO) при одинаковом приоритете
+    logger.info(f"Queueing message from {message.from_user.full_name} (Priority: {priority})")
+    await msg_queue.put((priority, time.time(), message, trigger_type))
 
 # --- ЗАПУСК ---
 async def main():
@@ -255,7 +293,10 @@ async def main():
     # 1. Запускаем фейковый сервер для Render
     await start_dummy_server()
     
-    # 2. Удаляем вебхук (на случай конфликтов) и запускаем поллинг
+    # 2. Запускаем воркер очереди
+    asyncio.create_task(queue_worker())
+    
+    # 3. Удаляем вебхук (на случай конфликтов) и запускаем поллинг
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("🤖 Bot started polling...")
     await dp.start_polling(bot)
