@@ -7,7 +7,7 @@ import asyncio
 import time
 from datetime import datetime
 from collections import deque
-from typing import Callable, Dict, Any, Awaitable
+from typing import Callable, Dict, Any, Awaitable, Tuple
 
 from aiogram import Router, Bot, Dispatcher, BaseMiddleware
 from aiogram.types import Message, TelegramObject
@@ -19,11 +19,15 @@ from aiohttp import web
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 USER_MAPPING = {
     814759080: "A. H.",
+    485898893: "Старый Мельник",
     1214336850: "Саня Блок",
-    485898893: "Влад Блок",
+    460174637: "Влад Блок",
     1313515064: "Булгак",
     1035739386: "Вован Крюк"
 }
+
+# Имя бота в истории, если модель вдруг не сгенерирует ник сама (резерв)
+DEFAULT_BOT_PERSONA = "BusinessGPT"
 
 BOT_USERNAME = "businessgpt_text_bot"
 MAX_INPUT_LENGTH = 800
@@ -60,7 +64,7 @@ async def start_dummy_server():
     await site.start()
     logger.info(f"✅ Dummy web server started on port {port}")
 
-# --- MIDDLEWARE (С ЛОГИРОВАНИЕМ ID) ---
+# --- MIDDLEWARE ---
 class HistoryMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -69,17 +73,16 @@ class HistoryMiddleware(BaseMiddleware):
         data: Dict[str, Any]
     ) -> Any:
         if isinstance(event, Message) and event.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-            # === ВРЕМЕННЫЙ ЛОГ ДЛЯ СБОРА ID ===
+            # Лог ID для отладки
             user = event.from_user
-            logger.info(f"🆔 USER INFO: ID={user.id} | Name='{user.full_name}' | Username=@{user.username}")
-            # ==================================
+            logger.info(f"🆔 USER INFO: ID={user.id} | Name='{user.full_name}'")
 
             text = event.text or event.caption or ""
-
             if len(text) > MAX_INPUT_LENGTH:
                 text = text[:MAX_INPUT_LENGTH]
 
             if text and not text.strip().startswith("/"):
+                # Удаляем упоминание
                 clean_text = re.sub(f"@{BOT_USERNAME}", "", text, flags=re.IGNORECASE).strip()
                 clean_text = re.sub(r'\s+', ' ', clean_text)
 
@@ -91,6 +94,7 @@ class HistoryMiddleware(BaseMiddleware):
                     if chat_id not in chat_histories:
                         chat_histories[chat_id] = deque(maxlen=10)
                     
+                    # Сохраняем сообщение пользователя в формате [Имя]: Текст
                     formatted_line = f"[{user_name}]: {clean_text}"
                     chat_histories[chat_id].append(formatted_line)
 
@@ -98,28 +102,56 @@ class HistoryMiddleware(BaseMiddleware):
 
 router.message.middleware(HistoryMiddleware())
 
-# --- ФУНКЦИЯ ОЧИСТКИ ---
-def clean_model_output(full_response: str, input_context: str) -> str | None:
+# --- ФУНКЦИЯ ОБРАБОТКИ ОТВЕТА МОДЕЛИ ---
+def parse_model_response(full_response: str, input_context: str) -> Tuple[str | None, str | None]:
+    """
+    Возвращает кортеж:
+    1. Текст для отправки в чат (без [Имя]:)
+    2. Полная строка для сохранения в историю (с [Имя]:)
+    """
     if not full_response:
-        return None
+        return None, None
+
+    # 1. Убираем входной контекст
     if full_response.startswith(input_context):
         generated_only = full_response[len(input_context):]
     else:
         generated_only = full_response
-    generated_only = generated_only.strip()
-    if not generated_only:
-        return None
-    clean_text = re.sub(r"^\[.*?\]:\s*", "", generated_only)
-    split_match = re.search(r"\n\[.*?\]:", clean_text)
-    if split_match:
-        clean_text = clean_text[:split_match.start()]
-    return clean_text.strip() if clean_text.strip() else None
+
+    if not generated_only.strip():
+        return None, None
+
+    # 2. Разбиваем на строки и берем ПОСЛЕДНЮЮ непустую
+    lines = [line.strip() for line in generated_only.split('\n') if line.strip()]
+    if not lines:
+        return None, None
+    
+    last_line = lines[-1] # Берем последнюю строку, как просили
+
+    # 3. Пытаемся найти паттерн [Имя]: Текст
+    # Regex ищет что-то в квадратных скобках в начале строки, потом двоеточие
+    match = re.match(r"^\[(.*?)\]:\s*(.*)", last_line)
+
+    if match:
+        # Если модель сгенерировала "[Саня Блок]: Привет"
+        persona_name = match.group(1) # Саня Блок
+        content_text = match.group(2).strip() # Привет
+        
+        full_history_line = last_line # В историю пишем как есть: [Саня Блок]: Привет
+        text_to_send = content_text   # В чат пишем: Привет
+    else:
+        # Если модель сгенерировала просто текст без ника (редко, но бывает)
+        text_to_send = last_line
+        # В историю добавляем дефолтный ник, чтобы не ломать структуру
+        full_history_line = f"[{DEFAULT_BOT_PERSONA}]: {last_line}"
+
+    return text_to_send, full_history_line
 
 # --- ЗАПРОС К API ---
-async def make_api_request(context_string: str) -> str | None:
+async def make_api_request(context_string: str) -> Tuple[str | None, str | None]:
     if not ML_MODEL_URL:
         logger.error("ML_MODEL_URL is not set!")
-        return None
+        return None, None
     url = ML_MODEL_URL if ML_MODEL_URL.endswith("generate") else f"{ML_MODEL_URL.rstrip('/')}/generate"
     timeout_settings = aiohttp.ClientTimeout(total=30, connect=5)
 
@@ -133,15 +165,18 @@ async def make_api_request(context_string: str) -> str | None:
                 if response.status == 200:
                     data = await response.json()
                     raw_text = data.get("generated_text", "")
+                    
                     preview = raw_text[len(context_string):].strip().replace('\n', ' ')[:50]
                     logger.info(f"Done in {duration:.2f}s. Raw start: '{preview}...'")
-                    return clean_model_output(raw_text, context_string)
+                    
+                    # Используем новую функцию парсинга
+                    return parse_model_response(raw_text, context_string)
                 else:
                     logger.error(f"API Error {response.status}")
-                    return None
+                    return None, None
     except Exception as e:
         logger.error(f"API Exception: {e}")
-        return None
+        return None, None
 
 # --- ВОРКЕР ОЧЕРЕДИ ---
 async def queue_worker():
@@ -150,39 +185,69 @@ async def queue_worker():
         try:
             priority, _, message, trigger_type = await msg_queue.get()
             chat_id = message.chat.id
-            if chat_id not in chat_histories or not chat_histories[chat_id]:
-                msg_queue.task_done()
-                continue
+            
+            logger.info(f"👷 Worker processing: Chat={chat_id}, Trigger={trigger_type}, Queue Size={msg_queue.qsize()}")
 
-            context_string = "\n".join(chat_histories[chat_id]) + "\n"
+            # --- СБОР КОНТЕКСТА ---
+            context_string = ""
+            has_history = chat_id in chat_histories and chat_histories[chat_id]
+            
+            if has_history:
+                context_string = "\n".join(chat_histories[chat_id]) + "\n"
+            
+            if not has_history:
+                if trigger_type == "forced":
+                    logger.info("History empty, but forced trigger. Creating temporary context.")
+                    raw_text = message.text or ""
+                    clean_text = re.sub(f"@{BOT_USERNAME}", "", raw_text, flags=re.IGNORECASE).strip()
+                    if not clean_text: 
+                        clean_text = "..." 
+                    user_name = USER_MAPPING.get(message.from_user.id, message.from_user.full_name)
+                    context_string = f"[{user_name}]: {clean_text}\n"
+                else:
+                    logger.info("Skipping: Random trigger but no history.")
+                    msg_queue.task_done()
+                    continue
+
             if trigger_type == "forced":
                 await message.bot.send_chat_action(chat_id, "typing")
 
-            result = await make_api_request(context_string)
-            if result:
+            # --- ЗАПРОС И ОТПРАВКА ---
+            # Получаем (Текст для чата, Строка для истории)
+            text_to_send, history_line = await make_api_request(context_string)
+            
+            if text_to_send and history_line:
                 try:
                     if trigger_type == "forced":
-                        await message.reply(result)
+                        await message.reply(text_to_send)
                     else:
-                        await message.answer(result)
+                        await message.answer(text_to_send)
                     
-                    # Добавляем ответ бота в историю
-                    chat_histories[chat_id].append(f"[BOT]: {result}")
+                    if chat_id not in chat_histories:
+                        chat_histories[chat_id] = deque(maxlen=10)
+                        
+                    # ВАЖНО: Добавляем в историю полную строку (например "[Саня Блок]: Привет")
+                    chat_histories[chat_id].append(history_line)
                     
-                    # === ЛОГ ДЛЯ ПРОВЕРКИ КОНТЕКСТА ===
-                    logger.info(f"📝 --- CURRENT CONTEXT (Chat: {chat_id}) ---")
+                    # === ЛОГ ДЛЯ ПРОВЕРКИ ===
+                    logger.info(f"✅ Sent: '{text_to_send}'")
+                    logger.info(f"💾 Saved to History: '{history_line}'")
+                    logger.info(f"📝 --- CURRENT CONTEXT ---")
                     for i, line in enumerate(chat_histories[chat_id]):
                         logger.info(f"{i+1}. {line}")
-                    logger.info(f"📝 ---------------------------------------")
-                    # ==================================
+                    logger.info(f"📝 -----------------------")
+                    # ========================
                     
                 except Exception as e:
                     logger.error(f"Failed to send message: {e}")
+            else:
+                logger.warning("Model returned empty or invalid result")
             
             msg_queue.task_done()
             await asyncio.sleep(1)
+            
         except Exception as e:
-            logger.error(f"Error in queue worker: {e}")
+            logger.error(f"Error in queue worker: {e}", exc_info=True)
             await asyncio.sleep(1)
 
 # --- КОМАНДЫ ---
@@ -222,7 +287,6 @@ async def handle_messages(message: Message):
     trigger_type = None
     priority = 10 
 
-    # Игнорируем реплаи не боту (если нет упоминания)
     if is_reply and not is_reply_to_bot and not has_mention:
         return
 
