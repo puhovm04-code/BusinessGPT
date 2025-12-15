@@ -29,11 +29,9 @@ USER_MAPPING = {
     1035739386: "Вован Крюк",
     407221863: "Некит Русанов",
     1878550901: "Егориус"
-    # Остальных добавишь, посмотрев в логи с пометкой [ID LOG]
 }
 
 # Выбираем "дефолтную" личность для замены [BOT]. 
-# Берём первого из списка (A. H.) или любого другого, кого знает модель.
 DEFAULT_PERSONA = list(USER_MAPPING.values())[0] 
 
 BOT_USERNAME = "businessgpt_text_bot"
@@ -100,6 +98,7 @@ class HistoryMiddleware(BaseMiddleware):
                 text = text[:MAX_INPUT_LENGTH]
 
             if text and not text.strip().startswith("/"):
+                # Убираем обращение к боту из текста, который идет в память
                 clean_text = re.sub(f"@{BOT_USERNAME}", "", text, flags=re.IGNORECASE).strip()
                 clean_text = re.sub(r'\s+', ' ', clean_text)
 
@@ -149,14 +148,20 @@ def process_model_output(full_response: str, input_context: str) -> Tuple[str | 
     
     if match_prefix:
         persona_name = match_prefix.group(1)
-        clean_text = match_prefix.group(2).strip()
+        raw_text = match_prefix.group(2).strip()
+        
+        # --- ИЗМЕНЕНИЕ: УДАЛЯЕМ СОБАКУ (@) ИЗ ТЕКСТА ---
+        clean_text = raw_text.replace("@", "")
+        
         history_line = f"[{persona_name}]: {clean_text}"
         return clean_text, history_line
     else:
-        # ВАЖНОЕ ИЗМЕНЕНИЕ: 
-        # Если модель не дала имя, мы НЕ пишем [BOT], а подставляем валидного персонажа
-        # чтобы не портить историю для будущих генераций
-        clean_text = first_message_block
+        # Если модель не дала имя, подставляем дефолтное
+        raw_text = first_message_block
+        
+        # --- ИЗМЕНЕНИЕ: УДАЛЯЕМ СОБАКУ (@) ИЗ ТЕКСТА ---
+        clean_text = raw_text.replace("@", "")
+        
         history_line = f"[{DEFAULT_PERSONA}]: {clean_text}"
         return clean_text, history_line
 
@@ -171,11 +176,8 @@ async def make_api_request(chat_id: int) -> Tuple[str | None, str | None]:
     context_string = ""
     
     for line in history_list:
-        # ВАЖНОЕ ИЗМЕНЕНИЕ:
-        # Проверяем, нет ли в истории [BOT]. Если есть - меняем на валидного персонажа.
-        # Это защищает модель от неизвестного токена.
+        # Замена [BOT] на валидное имя перед отправкой
         if line.strip().startswith("[BOT]:"):
-            # Заменяем [BOT] на дефолтную персону (например, A. H.) только для запроса
             clean_line = line.replace("[BOT]:", f"[{DEFAULT_PERSONA}]:", 1)
             context_string += f"{clean_line}\n"
         else:
