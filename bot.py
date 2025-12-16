@@ -31,7 +31,7 @@ USER_MAPPING = {
     1878550901: "Егориус"
 }
 
-# Выбираем "дефолтную" личность для замены [BOT]. 
+# Дефолтная персона для замены [BOT]
 DEFAULT_PERSONA = list(USER_MAPPING.values())[0] 
 
 BOT_USERNAME = "businessgpt_text_bot"
@@ -98,7 +98,7 @@ class HistoryMiddleware(BaseMiddleware):
                 text = text[:MAX_INPUT_LENGTH]
 
             if text and not text.strip().startswith("/"):
-                # Убираем обращение к боту из текста, который идет в память
+                # Убираем обращение к боту из текста истории
                 clean_text = re.sub(f"@{BOT_USERNAME}", "", text, flags=re.IGNORECASE).strip()
                 clean_text = re.sub(r'\s+', ' ', clean_text)
 
@@ -150,7 +150,7 @@ def process_model_output(full_response: str, input_context: str) -> Tuple[str | 
         persona_name = match_prefix.group(1)
         raw_text = match_prefix.group(2).strip()
         
-        # --- ИЗМЕНЕНИЕ: УДАЛЯЕМ СОБАКУ (@) ИЗ ТЕКСТА ---
+        # Убираем собаку (@) чтобы не тегать
         clean_text = raw_text.replace("@", "")
         
         history_line = f"[{persona_name}]: {clean_text}"
@@ -158,8 +158,6 @@ def process_model_output(full_response: str, input_context: str) -> Tuple[str | 
     else:
         # Если модель не дала имя, подставляем дефолтное
         raw_text = first_message_block
-        
-        # --- ИЗМЕНЕНИЕ: УДАЛЯЕМ СОБАКУ (@) ИЗ ТЕКСТА ---
         clean_text = raw_text.replace("@", "")
         
         history_line = f"[{DEFAULT_PERSONA}]: {clean_text}"
@@ -187,7 +185,10 @@ async def make_api_request(chat_id: int) -> Tuple[str | None, str | None]:
     if not url.endswith("generate"):
         url = f"{url.rstrip('/')}/generate"
 
-    timeout_settings = aiohttp.ClientTimeout(total=40, connect=10)
+    # --- ИСПРАВЛЕНИЕ: УВЕЛИЧЕН ТАЙМАУТ ДО 120 СЕКУНД ---
+    # total=120: Ждем ответ до 2 минут (для холодного старта)
+    # connect=15: Если сервер лежит полностью, отвалимся через 15 сек
+    timeout_settings = aiohttp.ClientTimeout(total=120, connect=15)
 
     try:
         async with aiohttp.ClientSession(timeout=timeout_settings) as session:
@@ -216,7 +217,7 @@ async def make_api_request(chat_id: int) -> Tuple[str | None, str | None]:
                     return None, None
                     
     except asyncio.TimeoutError:
-        logger.error("API Timeout (>40s)")
+        logger.error("API Timeout (>120s)") # Обновил текст ошибки
         return None, None
     except Exception as e:
         logger.error(f"API Exception: {e}")
