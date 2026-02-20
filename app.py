@@ -8,7 +8,7 @@ from aiogram.types import Update
 from aiogram.fsm.storage.memory import MemoryStorage
 from bot import router as bot_router
 
-API_TOKEN = os.getenv("API_TOKEN")
+API_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 bot = Bot(token=API_TOKEN)
